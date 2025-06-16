@@ -10,406 +10,418 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 
 app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///novels.db'  # SQLite数据库
+
+# 配置数据库
+basedir = os.path.abspath(os.path.dirname(__file__))
+app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///' + os.path.join(basedir, 'novels.db')
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# 定义数据库模型 - 小说目录表
-class NovelCatalog(db.Model):
-    __tablename__ = 'novel_catalog'
-    id = db.Column(db.Integer, primary_key=True)
-    novel_name = db.Column(db.String(100), nullable=False)  # 小说名称
-    chapter_id = db.Column(db.String(50), nullable=False)  # 章节ID
-    chapter_title = db.Column(db.String(200), nullable=False)  # 章节标题
-    chapter_url = db.Column(db.String(500), nullable=False)  # 章节URL
-    novel_url = db.Column(db.String(500), nullable=False)  # 小说目录页URL
-    
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'novel_name': self.novel_name,
-            'chapter_id': self.chapter_id,
-            'chapter_title': self.chapter_title,
-            'chapter_url': self.chapter_url,
-            'novel_url': self.novel_url
-        }
+# 定义数据库模型
 
-# 定义数据库模型 - 小说内容表
-class NovelContent(db.Model):
-    __tablename__ = 'novel_content'
+# 小说目录表
+class Novel(db.Model):
     id = db.Column(db.Integer, primary_key=True)
-    chapter_id = db.Column(db.String(50), nullable=False)  # 章节ID
-    content = db.Column(db.Text, nullable=False)  # 章节内容
-    novel_name = db.Column(db.String(100), nullable=False)  # 小说名称
+    title = db.Column(db.String(200), unique=True, nullable=False)  # 小说名称
+    source_url = db.Column(db.String(500), nullable=False)  # 小说源URL
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())  # 创建时间
     
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'chapter_id': self.chapter_id,
-            'content': self.content,
-            'novel_name': self.novel_name
-        }
+    # 定义与章节的一对多关系
+    chapters = db.relationship('Chapter', backref='novel', lazy=True)
+
+# 章节内容表
+class Chapter(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(200), nullable=False)  # 章节标题
+    url = db.Column(db.String(500), nullable=False)  # 章节URL
+    content = db.Column(db.Text, nullable=False)  # 章节内容
+    novel_id = db.Column(db.Integer, db.ForeignKey('novel.id'), nullable=False)  # 关联的小说ID
+    order_num = db.Column(db.Integer, nullable=False)  # 章节顺序号
+    created_at = db.Column(db.DateTime, default=db.func.current_timestamp())  # 创建时间
 
 # 创建数据库表
 with app.app_context():
     db.create_all()
 
-# 请求头设置
-HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-}
+# 爬虫相关函数
 
-# 线程池 - 12线程
-THREAD_POOL = ThreadPoolExecutor(max_workers=12)
-
-def clean_content(content):
-    """清理小说内容，去除广告和非正文内容"""
+def clean_content(text):
+    """清理章节内容，去除广告和非正文内容"""
     # 去除常见的广告标签
     patterns = [
-        r'<div class="ads.*?</div>',
-        r'<script.*?</script>',
-        r'<a href=.*?</a>',
-        r'<p>.*?请收藏.*?</p>',
-        r'<p>.*?推荐.*?</p>',
-        r'<p>.*?求.*?</p>',
-        r'<p>.*?本章未完.*?</p>',
-        r'<p>.*?继续阅读.*?</p>',
-        r'<p>.*?记住网址.*?</p>',
-        r'<p>.*?biq.*?</p>',
-        r'<p>.*?笔趣.*?</p>',
-        r'<p>.*?\(\)',
+        r'[\s\S]*?biq.*?ge.*?com[\s\S]*?',
+        r'请收藏.*?网址',
+        r'记住.*?网址',
+        r'\(.*?\)',
+        r'\[.*?\]',
+        r'【.*?】',
+        r'<.*?>',
+        r'&nbsp;',
+        r'本章未完.*?',
+        r'继续阅读',
+        r'PS:.*?',
+        r'求.*?票',
+        r'推.*?书',
+        r'新书.*?',
+        r'推荐.*?',
+        r'\(未完待续.*?\)',
     ]
     
     for pattern in patterns:
-        content = re.sub(pattern, '', content, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(pattern, '', text)
     
-    # 去除多余的空行
-    content = re.sub(r'\n{3,}', '\n\n', content)
-    return content.strip()
+    # 去除多余的空格和换行
+    text = re.sub(r'\s+', '\n', text).strip()
+    
+    return text
 
-def get_novel_info(url):
-    """获取小说目录信息"""
-    try:
-        response = requests.get(url, headers=HEADERS)
-        response.encoding = 'utf-8'
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # 获取小说名称
-        novel_name = soup.find('h1').text.strip()
-        
-        # 获取所有章节链接
-        chapters = []
-        chapter_list = soup.find('div', id='list')
-        if not chapter_list:
-            chapter_list = soup.find('div', class_='listmain')
-        
-        for a in chapter_list.find_all('a'):
-            if 'href' in a.attrs and a.text.strip():
-                chapter_url = urljoin(url, a['href'])
-                chapter_title = a.text.strip()
-                chapter_id = chapter_url.split('/')[-1].split('.')[0]
-                
-                chapters.append({
-                    'chapter_id': chapter_id,
-                    'chapter_title': chapter_title,
-                    'chapter_url': chapter_url,
-                    'novel_name': novel_name,
-                    'novel_url': url
-                })
-        
-        return novel_name, chapters
-    except Exception as e:
-        print(f"获取小说目录信息失败: {e}")
-        return None, []
-
-def fetch_chapter_content(chapter_info):
+def get_chapter_content(url):
     """获取章节内容"""
     try:
-        response = requests.get(chapter_info['chapter_url'], headers=HEADERS)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
         response.encoding = 'utf-8'
         soup = BeautifulSoup(response.text, 'html.parser')
         
-        # 查找内容区域
+        # 查找章节内容 - 根据网站结构调整
         content_div = soup.find('div', id='content')
-        if not content_div:
-            content_div = soup.find('div', class_='content')
-        
         if content_div:
-            # 清理内容
-            content = str(content_div)
-            content = clean_content(content)
-            
-            # 保存到数据库
-            with app.app_context():
-                # 检查是否已存在
-                existing = NovelContent.query.filter_by(
-                    chapter_id=chapter_info['chapter_id'],
-                    novel_name=chapter_info['novel_name']
-                ).first()
-                
-                if not existing:
-                    novel_content = NovelContent(
-                        chapter_id=chapter_info['chapter_id'],
-                        content=content,
-                        novel_name=chapter_info['novel_name']
-                    )
-                    db.session.add(novel_content)
-                    db.session.commit()
-            
-            return True
-        return False
+            content = content_div.get_text()
+            return clean_content(content)
+        else:
+            return "内容获取失败"
     except Exception as e:
-        print(f"获取章节内容失败: {e}")
-        return False
-
-def save_catalog_to_db(novel_name, chapters, novel_url):
-    """保存目录信息到数据库"""
-    with app.app_context():
-        # 先删除旧的目录信息
-        NovelCatalog.query.filter_by(novel_name=novel_name).delete()
-        
-        # 添加新的目录信息
-        for chapter in chapters:
-            catalog = NovelCatalog(
-                novel_name=novel_name,
-                chapter_id=chapter['chapter_id'],
-                chapter_title=chapter['chapter_title'],
-                chapter_url=chapter['chapter_url'],
-                novel_url=novel_url
-            )
-            db.session.add(catalog)
-        
-        db.session.commit()
+        print(f"获取章节内容出错: {e}")
+        return "内容获取失败"
 
 def crawl_novel(url):
-    """爬取小说"""
-    start_time = time.time()
+    """爬取小说目录和内容"""
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        response = requests.get(url, headers=headers, timeout=10)
+        response.encoding = 'utf-8'
+        soup = BeautifulSoup(response.text, 'html.parser')
+        
+        # 获取小说标题
+        title_tag = soup.find('h1')
+        if title_tag:
+            title = title_tag.get_text().strip()
+        else:
+            title = "未知小说"
+        
+        # 检查小说是否已存在
+        existing_novel = Novel.query.filter_by(title=title).first()
+        if existing_novel:
+            return {"status": "exists", "novel_id": existing_novel.id}
+        
+        # 创建小说记录
+        novel = Novel(title=title, source_url=url)
+        db.session.add(novel)
+        db.session.commit()
+        
+        # 获取章节列表
+        chapter_links = []
+        list_div = soup.find('div', id='list')
+        if list_div:
+            chapters = list_div.find_all('a')
+            for idx, chapter in enumerate(chapters, start=1):
+                chapter_url = urljoin(url, chapter['href'])
+                chapter_title = chapter.get_text().strip()
+                chapter_links.append((idx, chapter_title, chapter_url))
+        
+        # 使用多线程爬取章节内容
+        def process_chapter(chapter_data):
+            order_num, chapter_title, chapter_url = chapter_data
+            content = get_chapter_content(chapter_url)
+            chapter = Chapter(
+                title=chapter_title,
+                url=chapter_url,
+                content=content,
+                novel_id=novel.id,
+                order_num=order_num
+            )
+            db.session.add(chapter)
+        
+        # 使用12个线程
+        with ThreadPoolExecutor(max_workers=12) as executor:
+            executor.map(process_chapter, chapter_links)
+        
+        db.session.commit()
+        
+        return {"status": "success", "novel_id": novel.id}
     
-    # 获取小说目录信息
-    novel_name, chapters = get_novel_info(url)
-    if not novel_name or not chapters:
-        return False, "获取小说目录失败"
-    
-    # 保存目录到数据库
-    save_catalog_to_db(novel_name, chapters, url)
-    
-    # 使用线程池获取所有章节内容
-    futures = []
-    for chapter in chapters:
-        futures.append(THREAD_POOL.submit(fetch_chapter_content, chapter))
-    
-    # 等待所有线程完成
-    for future in futures:
-        future.result()
-    
-    end_time = time.time()
-    return True, f"爬取完成，耗时 {end_time - start_time:.2f} 秒"
+    except Exception as e:
+        print(f"爬取小说出错: {e}")
+        db.session.rollback()
+        return {"status": "error", "message": str(e)}
+
+# 网页路由
 
 @app.route('/')
 def index():
-    """首页"""
-    return render_template('index.html')
+    """首页，显示小说列表和搜索框"""
+    novels = Novel.query.order_by(Novel.created_at.desc()).all()
+    return render_template('index.html', novels=novels)
+
+@app.route('/crawl', methods=['POST'])
+def crawl():
+    """处理爬取请求"""
+    url = request.form.get('url')
+    if not url:
+        return jsonify({"status": "error", "message": "URL不能为空"})
+    
+    # 启动爬虫线程
+    def crawl_task():
+        crawl_novel(url)
+    
+    thread = threading.Thread(target=crawl_task)
+    thread.start()
+    
+    return jsonify({"status": "processing", "message": "爬取任务已开始，请稍后刷新页面查看结果"})
+
+# API接口
 
 @app.route('/api/novels', methods=['GET'])
 def get_novels():
-    """获取小说列表接口"""
-    novels = db.session.query(NovelCatalog.novel_name, NovelCatalog.novel_url).distinct().all()
-    novel_list = [{'name': novel[0], 'url': novel[1]} for novel in novels]
-    return jsonify({'code': 0, 'data': novel_list})
+    """获取所有小说列表"""
+    novels = Novel.query.order_by(Novel.title).all()
+    result = [{
+        "id": novel.id,
+        "title": novel.title,
+        "source_url": novel.source_url,
+        "created_at": novel.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+        "chapter_count": len(novel.chapters)
+    } for novel in novels]
+    return jsonify({"status": "success", "data": result})
 
-@app.route('/api/catalog', methods=['GET'])
-def get_catalog():
-    """获取小说目录接口"""
-    novel_name = request.args.get('novel_name')
-    novel_id = request.args.get('novel_id')
+@app.route('/api/novel/<novel_id_or_name>', methods=['GET'])
+def get_novel(novel_id_or_name):
+    """根据小说ID或名称获取目录"""
+    # 先尝试按ID查找
+    if novel_id_or_name.isdigit():
+        novel = Novel.query.get(int(novel_id_or_name))
+    else:
+        # 按名称查找
+        novel = Novel.query.filter_by(title=novel_id_or_name).first()
     
-    if not novel_name and not novel_id:
-        return jsonify({'code': 1, 'msg': '参数错误'})
+    if not novel:
+        return jsonify({"status": "error", "message": "小说不存在"})
     
-    query = NovelCatalog.query
-    if novel_name:
-        query = query.filter_by(novel_name=novel_name)
-    if novel_id:
-        query = query.filter_by(id=novel_id)
+    chapters = Chapter.query.filter_by(novel_id=novel.id).order_by(Chapter.order_num).all()
+    result = [{
+        "id": chapter.id,
+        "title": chapter.title,
+        "order_num": chapter.order_num,
+        "url": chapter.url
+    } for chapter in chapters]
     
-    catalogs = query.order_by(NovelCatalog.id).all()
-    return jsonify({'code': 0, 'data': [catalog.to_dict() for catalog in catalogs]})
+    return jsonify({
+        "status": "success",
+        "novel": {
+            "id": novel.id,
+            "title": novel.title,
+            "source_url": novel.source_url
+        },
+        "chapters": result
+    })
 
-@app.route('/api/content', methods=['GET'])
-def get_content():
-    """获取章节内容接口"""
-    chapter_id = request.args.get('chapter_id')
-    if not chapter_id:
-        return jsonify({'code': 1, 'msg': '参数错误'})
+@app.route('/api/chapter/<int:chapter_id>', methods=['GET'])
+def get_chapter(chapter_id):
+    """根据章节ID获取内容"""
+    chapter = Chapter.query.get(chapter_id)
+    if not chapter:
+        return jsonify({"status": "error", "message": "章节不存在"})
     
-    content = NovelContent.query.filter_by(chapter_id=chapter_id).first()
-    if not content:
-        return jsonify({'code': 2, 'msg': '章节不存在'})
-    
-    return jsonify({'code': 0, 'data': content.to_dict()})
+    return jsonify({
+        "status": "success",
+        "chapter": {
+            "id": chapter.id,
+            "title": chapter.title,
+            "novel_id": chapter.novel_id,
+            "novel_title": chapter.novel.title,
+            "content": chapter.content,
+            "order_num": chapter.order_num
+        }
+    })
 
-@app.route('/api/crawl', methods=['POST'])
-def start_crawl():
-    """开始爬取小说接口"""
-    url = request.form.get('url')
-    novel_name = request.form.get('novel_name')
-    
-    if not url:
-        return jsonify({'code': 1, 'msg': 'URL不能为空'})
-    
-    # 检查是否已存在
-    if novel_name and NovelCatalog.query.filter_by(novel_name=novel_name).first():
-        return jsonify({'code': 2, 'msg': '小说已存在'})
-    
-    # 启动爬虫线程
-    threading.Thread(target=crawl_novel, args=(url,)).start()
-    
-    return jsonify({'code': 0, 'msg': '开始爬取'})
+# 模板文件
 
-if __name__ == '__main__':
-    # 创建模板目录
-    if not os.path.exists('templates'):
-        os.makedirs('templates')
-    
-    # 创建默认的index.html模板
-    if not os.path.exists('templates/index.html'):
-        with open('templates/index.html', 'w', encoding='utf-8') as f:
-            f.write('''<!DOCTYPE html>
-<html lang="zh-CN">
+@app.route('/novel/<int:novel_id>')
+def novel_detail(novel_id):
+    """小说详情页"""
+    novel = Novel.query.get_or_404(novel_id)
+    chapters = Chapter.query.filter_by(novel_id=novel.id).order_by(Chapter.order_num).all()
+    return render_template('novel_detail.html', novel=novel, chapters=chapters)
+
+@app.route('/chapter/<int:chapter_id>')
+def chapter_detail(chapter_id):
+    """章节详情页"""
+    chapter = Chapter.query.get_or_404(chapter_id)
+    return render_template('chapter_detail.html', chapter=chapter)
+
+# 创建模板目录
+templates_dir = os.path.join(basedir, 'templates')
+if not os.path.exists(templates_dir):
+    os.makedirs(templates_dir)
+
+# 创建HTML模板文件
+index_html = """
+<!DOCTYPE html>
+<html>
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>小说爬虫服务</title>
     <style>
-        body { font-family: Arial, sans-serif; max-width: 1000px; margin: 0 auto; padding: 20px; }
-        .container { margin-top: 30px; }
-        .form-group { margin-bottom: 15px; }
-        input[type="text"] { width: 100%; padding: 8px; box-sizing: border-box; }
-        button { padding: 8px 15px; background: #007bff; color: white; border: none; cursor: pointer; }
-        button:hover { background: #0056b3; }
-        .novel-list { margin-top: 20px; }
-        .novel-item { padding: 10px; border-bottom: 1px solid #eee; }
-        .novel-item:hover { background: #f5f5f5; }
-        .chapter-list { margin-top: 20px; }
-        .chapter-item { padding: 8px; border-bottom: 1px dashed #ddd; }
-        .content { margin-top: 20px; white-space: pre-line; line-height: 1.6; }
+        body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; }
+        h1 { text-align: center; }
+        .search-box { margin: 20px 0; text-align: center; }
+        input[type="text"] { width: 60%; padding: 8px; }
+        button { padding: 8px 16px; }
+        .novel-list { margin-top: 30px; }
+        .novel-item { border: 1px solid #ddd; padding: 15px; margin-bottom: 15px; border-radius: 5px; }
+        .novel-title { font-size: 1.2em; font-weight: bold; margin-bottom: 5px; }
+        .novel-meta { color: #666; font-size: 0.9em; margin-bottom: 10px; }
+        .novel-link { color: #06c; text-decoration: none; }
+        .status { padding: 5px 10px; border-radius: 3px; }
+        .status-processing { background-color: #ffeb3b; }
+        .status-success { background-color: #4caf50; color: white; }
+        .status-error { background-color: #f44336; color: white; }
     </style>
 </head>
 <body>
     <h1>小说爬虫服务</h1>
     
-    <div class="container">
-        <h2>爬取新小说</h2>
-        <div class="form-group">
-            <input type="text" id="novelUrl" placeholder="输入小说目录页URL，例如：https://www.biqvkk.cc/10_10864/4029000.html">
+    <div class="search-box">
+        <form id="crawlForm">
+            <input type="text" name="url" placeholder="输入小说目录页URL，例如：https://www.biqvkk.cc/10_10864/4029000.html" required>
+            <button type="submit">开始爬取</button>
+        </form>
+        <div id="message" style="margin-top: 10px;"></div>
+    </div>
+    
+    <div class="novel-list">
+        <h2>已爬取的小说列表</h2>
+        {% for novel in novels %}
+        <div class="novel-item">
+            <div class="novel-title">
+                <a href="/novel/{{ novel.id }}" class="novel-link">{{ novel.title }}</a>
+            </div>
+            <div class="novel-meta">
+                章节数: {{ novel.chapters|length }} | 创建时间: {{ novel.created_at.strftime('%Y-%m-%d %H:%M') }}
+            </div>
+            <a href="/api/novel/{{ novel.id }}" target="_blank">查看API数据</a>
         </div>
-        <button onclick="startCrawl()">开始爬取</button>
-        
-        <h2>小说列表</h2>
-        <div class="novel-list" id="novelList"></div>
-        
-        <div class="chapter-list" id="chapterList" style="display: none;">
-            <h3>目录</h3>
-            <div id="chapters"></div>
-        </div>
-        
-        <div class="content" id="content" style="display: none;">
-            <h3>内容</h3>
-            <div id="chapterContent"></div>
-        </div>
+        {% else %}
+        <p>暂无小说数据</p>
+        {% endfor %}
     </div>
     
     <script>
-        // 加载小说列表
-        function loadNovels() {
-            fetch('/api/novels')
-                .then(response => response.json())
-                .then(data => {
-                    if (data.code === 0) {
-                        const novelList = document.getElementById('novelList');
-                        novelList.innerHTML = '';
-                        
-                        if (data.data.length === 0) {
-                            novelList.innerHTML = '<p>暂无小说</p>';
-                            return;
-                        }
-                        
-                        data.data.forEach(novel => {
-                            const div = document.createElement('div');
-                            div.className = 'novel-item';
-                            div.innerHTML = `<a href="#" onclick="loadChapters('${novel.name}')">${novel.name}</a>`;
-                            novelList.appendChild(div);
-                        });
-                    }
-                });
-        }
-        
-        // 加载章节列表
-        function loadChapters(novelName) {
-            fetch(`/api/catalog?novel_name=${encodeURIComponent(novelName)}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.code === 0) {
-                        const chapterList = document.getElementById('chapterList');
-                        const chapters = document.getElementById('chapters');
-                        chapters.innerHTML = '';
-                        
-                        data.data.forEach(chapter => {
-                            const div = document.createElement('div');
-                            div.className = 'chapter-item';
-                            div.innerHTML = `<a href="#" onclick="loadContent('${chapter.chapter_id}')">${chapter.chapter_title}</a>`;
-                            chapters.appendChild(div);
-                        });
-                        
-                        chapterList.style.display = 'block';
-                        document.getElementById('content').style.display = 'none';
-                    }
-                });
-        }
-        
-        // 加载章节内容
-        function loadContent(chapterId) {
-            fetch(`/api/content?chapter_id=${chapterId}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.code === 0) {
-                        const contentDiv = document.getElementById('content');
-                        const chapterContent = document.getElementById('chapterContent');
-                        chapterContent.innerHTML = data.data.content;
-                        contentDiv.style.display = 'block';
-                    }
-                });
-        }
-        
-        // 开始爬取
-        function startCrawl() {
-            const url = document.getElementById('novelUrl').value.trim();
-            if (!url) {
-                alert('请输入URL');
-                return;
-            }
+        document.getElementById('crawlForm').addEventListener('submit', function(e) {
+            e.preventDefault();
+            const formData = new FormData(this);
+            const messageDiv = document.getElementById('message');
+            messageDiv.innerHTML = '<span class="status status-processing">处理中...</span>';
             
-            fetch('/api/crawl', {
+            fetch('/crawl', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                },
-                body: `url=${encodeURIComponent(url)}`
+                body: formData
             })
             .then(response => response.json())
             .then(data => {
-                if (data.code === 0) {
-                    alert('开始爬取，请稍后刷新查看');
-                } else {
-                    alert(data.msg);
+                if (data.status === 'processing') {
+                    messageDiv.innerHTML = `<span class="status status-processing">${data.message}</span>`;
+                    setTimeout(() => {
+                        window.location.reload();
+                    }, 3000);
+                } else if (data.status === 'error') {
+                    messageDiv.innerHTML = `<span class="status status-error">${data.message}</span>`;
                 }
+            })
+            .catch(error => {
+                messageDiv.innerHTML = `<span class="status status-error">请求失败: ${error}</span>`;
             });
-        }
-        
-        // 页面加载时获取小说列表
-        window.onload = loadNovels;
+        });
     </script>
 </body>
-</html>''')
+</html>
+"""
+
+novel_detail_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ novel.title }} - 目录</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1 { text-align: center; }
+        .back-link { display: block; margin-bottom: 20px; }
+        .chapter-list { list-style-type: none; padding: 0; }
+        .chapter-item { padding: 8px 0; border-bottom: 1px solid #eee; }
+        .chapter-link { color: #06c; text-decoration: none; }
+        .chapter-link:hover { text-decoration: underline; }
+    </style>
+</head>
+<body>
+    <a href="/" class="back-link">← 返回首页</a>
+    <h1>{{ novel.title }}</h1>
     
+    <ul class="chapter-list">
+        {% for chapter in chapters %}
+        <li class="chapter-item">
+            <a href="/chapter/{{ chapter.id }}" class="chapter-link">{{ chapter.order_num }}. {{ chapter.title }}</a>
+        </li>
+        {% endfor %}
+    </ul>
+</body>
+</html>
+"""
+
+chapter_detail_html = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ chapter.title }} - {{ chapter.novel.title }}</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto; padding: 20px; }
+        h1 { text-align: center; font-size: 1.5em; }
+        h2 { text-align: center; font-size: 1.2em; color: #666; margin-top: 0; }
+        .nav-links { display: flex; justify-content: space-between; margin: 20px 0; }
+        .nav-link { color: #06c; text-decoration: none; }
+        .content { line-height: 1.8; white-space: pre-line; }
+    </style>
+</head>
+<body>
+    <div class="nav-links">
+        <a href="/novel/{{ chapter.novel.id }}" class="nav-link">← 返回目录</a>
+    </div>
+    
+    <h1>{{ chapter.title }}</h1>
+    <h2>{{ chapter.novel.title }}</h2>
+    
+    <div class="content">
+        {{ chapter.content }}
+    </div>
+    
+    <div class="nav-links">
+        <a href="/novel/{{ chapter.novel.id }}" class="nav-link">← 返回目录</a>
+    </div>
+</body>
+</html>
+"""
+
+# 写入模板文件
+with open(os.path.join(templates_dir, 'index.html'), 'w', encoding='utf-8') as f:
+    f.write(index_html)
+
+with open(os.path.join(templates_dir, 'novel_detail.html'), 'w', encoding='utf-8') as f:
+    f.write(novel_detail_html)
+
+with open(os.path.join(templates_dir, 'chapter_detail.html'), 'w', encoding='utf-8') as f:
+    f.write(chapter_detail_html)
+
+if __name__ == '__main__':
     app.run(debug=True)
